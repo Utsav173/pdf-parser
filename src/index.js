@@ -7,16 +7,39 @@ function parseTransactionLine(line) {
 
 	const date = match[1];
 	let remainingLine = line.substring(date.length).trim();
-	const lastSignIndex = Math.max(remainingLine.lastIndexOf('+'), remainingLine.lastIndexOf('-'));
-	if (lastSignIndex === -1) return null;
 
-	const details = remainingLine.slice(0, lastSignIndex).trim();
-	const [description, reference = ''] = details.includes(' ')
-		? [details.slice(0, details.lastIndexOf(' ')), details.slice(details.lastIndexOf(' ') + 1)]
-		: [details, ''];
+	// Enhanced logic for description and reference separation
+	let description = '';
+	let reference = '';
+	let amountsPart = '';
 
-	const amountsPart = remainingLine.slice(lastSignIndex).trim();
-	const amounts = amountsPart.split(/\s+/).map((amt) => parseFloat(amt.replace(/[^\d.-]/g, '')) || 0);
+	const amountRegex = /([+-]?[\d,]+\.\d{2})\s*([\d,]+\.\d{2})?$/; // Regex to capture amounts at the end
+
+	const amountMatch = remainingLine.match(amountRegex);
+	if (amountMatch) {
+		amountsPart = remainingLine.slice(remainingLine.lastIndexOf(amountMatch[0])).trim();
+		const detailsPart = remainingLine.slice(0, remainingLine.lastIndexOf(amountMatch[0])).trim();
+
+		// Further split details part to separate description and reference (heuristic based on typical statement format)
+		const detailWords = detailsPart.split(/\s+/);
+		if (
+			(detailWords.length > 1 && detailWords.slice(-1)[0].startsWith('UPI')) ||
+			detailWords.slice(-1)[0].startsWith('FCM') ||
+			detailWords.slice(-1)[0].startsWith('IMPS') ||
+			detailWords.slice(-1)[0].match(/^\d+$/)
+		) {
+			reference = detailWords.pop(); // Assume last word is reference if it looks like UPI/RefNo
+			description = detailWords.join(' ').trim();
+		} else {
+			description = detailsPart; // If no clear reference, treat entire detail as description
+		}
+	} else {
+		return null; // If no amounts found, skip line (not a transaction)
+	}
+
+	const amounts = amountsPart
+		.split(/\s+/)
+		.map((amt) => parseFloat(amt.replace(/[^\d.-]/g, '')) || 0);
 
 	let debit = 0;
 	let credit = 0;
@@ -28,8 +51,8 @@ function parseTransactionLine(line) {
 
 	return {
 		date,
-		description: description.replace(/3 /, ''),
-		reference,
+		description: description.replace(/3 /, '').trim(), // Clean up description
+		reference: reference.trim(),
 		debit,
 		credit,
 		balance: amounts[1] || 0,
@@ -61,27 +84,31 @@ async function extractTransactions(dataBuffer) {
 
 		const startKeyword = 'DATE TRANSACTION DETAILS CHEQUE/REFERENCE# DEBIT CREDIT BALANCE';
 		const endKeywords = ['SUMMARY', 'Page ', 'AP-Aut'];
-		let transactions = [];
+
+		let allTransactions = [];
 
 		for (const pageText of pageTexts) {
 			const lines = pageText.split('\n');
 			const startIdx = lines.findIndex((line) => line.includes(startKeyword));
-			if (startIdx === -1) continue;
+			if (startIdx !== -1) {
+				const endIdx = lines.findIndex(
+					(line, idx) => idx > startIdx && endKeywords.some((key) => line.startsWith(key)),
+				);
 
-			const endIdx = lines.findIndex((line, idx) => idx > startIdx && endKeywords.some((key) => line.startsWith(key)));
+				const transactionLines = lines
+					.slice(startIdx + 1, endIdx > -1 ? endIdx : undefined)
+					.filter((line) => line.trim() && !line.startsWith('Page '));
 
-			const transactionLines = lines
-				.slice(startIdx + 1, endIdx > -1 ? endIdx : undefined)
-				.filter((line) => line.trim() && !line.startsWith('Page '));
+				const mergedLines = mergeTransactionLines(transactionLines); // Merge lines first!
+				const parsedLines = mergedLines.map(parseTransactionLine).filter(Boolean);
 
-			const parsedLines = mergeTransactionLines(transactionLines).map(parseTransactionLine).filter(Boolean);
-
-			transactions = [...transactions, ...parsedLines];
+				allTransactions = [...allTransactions, ...parsedLines];
+			}
 		}
 
-		if (!transactions.length) throw new Error('Table boundaries not found.');
+		if (!allTransactions.length) throw new Error('No transaction tables found.');
 
-		return transactions;
+		return allTransactions;
 	} catch (error) {
 		console.error('Error during PDF parsing:', error);
 		return { error: 'Error processing PDF', details: error.message };
@@ -125,13 +152,16 @@ export default {
 					},
 				});
 			} catch (error) {
-				return new Response(JSON.stringify({ error: 'Error processing PDF.', details: error.message }), {
-					status: 500,
-					headers: {
-						'Content-Type': 'application/json',
-						'Access-Control-Allow-Origin': '*',
+				return new Response(
+					JSON.stringify({ error: 'Error processing PDF.', details: error.message }),
+					{
+						status: 500,
+						headers: {
+							'Content-Type': 'application/json',
+							'Access-Control-Allow-Origin': '*',
+						},
 					},
-				});
+				);
 			}
 		}
 
